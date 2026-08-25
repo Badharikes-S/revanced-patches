@@ -1,0 +1,191 @@
+name: Update ReVanced API v4 feed
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: write
+  packages: read
+
+env:
+  UPSTREAM_PROJECT: "ReVanced%2Frevanced-patches"
+  UPSTREAM_REPOSITORY: "https://gitlab.com/ReVanced/revanced-patches.git"
+  PATCHES_PLUGIN_REPOSITORY: "https://github.com/ReVanced/revanced-patches-gradle-plugin.git"
+  PATCHES_PLUGIN_TAG: "v1.0.0-dev.10"
+  FEED_PATH: "bundles/revanced-latest-patches-bundle.json"
+
+jobs:
+  update:
+    name: Build and publish stable ReVanced patches
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out feed repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Resolve latest stable upstream release
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          releases="$(curl --fail --silent --show-error --location --retry 3 \
+            "https://gitlab.com/api/v4/projects/${UPSTREAM_PROJECT}/releases?per_page=100")"
+          stable="$(jq -c '[.[] | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | sort_by(.released_at // .created_at) | last' <<<"$releases")"
+          test "$stable" != "null" -a -n "$stable"
+
+          tag="$(jq -r '.tag_name' <<<"$stable")"
+          commit="$(jq -r '.commit.id' <<<"$stable")"
+          published="$(jq -r '.released_at // .created_at' <<<"$stable")"
+          test -n "$tag" -a "$tag" != "null"
+          test -n "$commit" -a "$commit" != "null"
+          test -n "$published" -a "$published" != "null"
+
+          release_time="$(date -u -d "$published" +%Y-%m-%dT%H:%M:%S)"
+          release_tag="upstream-${tag#v}"
+          artifact_name="revanced-patches-${tag}.rvp"
+          download_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${release_tag}/${artifact_name}"
+          page_url="https://gitlab.com/ReVanced/revanced-patches/-/releases/${tag}"
+
+          {
+            echo "tag=$tag"
+            echo "commit=$commit"
+            echo "release_time=$release_time"
+            echo "release_tag=$release_tag"
+            echo "artifact_name=$artifact_name"
+            echo "download_url=$download_url"
+            echo "page_url=$page_url"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Resolved stable upstream release $tag at $commit"
+
+      - name: Fetch upstream source and build plugin
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$UPSTREAM_TAG" "$UPSTREAM_REPOSITORY" upstream
+          git clone --depth 1 --branch "$PATCHES_PLUGIN_TAG" \
+            "$PATCHES_PLUGIN_REPOSITORY" gradle-plugin
+
+          # The official plugin is published to ReVanced's GitHub Packages registry.
+          # Including the exact tagged plugin source makes this feed reproducible and
+          # avoids requiring a personal package token in the destination repository.
+          sed -i 's|pluginManagement {|pluginManagement {\n    includeBuild("../gradle-plugin")|' \
+            upstream/settings.gradle.kts
+
+      - name: Build the upstream .rvp artifact
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd upstream
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            -PgithubPackagesUsername="${GITHUB_ACTOR}" \
+            -PgithubPackagesPassword="${GITHUB_TOKEN}" \
+            clean :patches:buildAndroid
+
+          mapfile -t artifacts < <(find patches/build/libs -maxdepth 1 -type f -name '*.rvp' \
+            ! -name '*sources*' ! -name '*javadoc*' | sort)
+          test "${#artifacts[@]}" -eq 1
+          mkdir -p ../output
+          cp "${artifacts[0]}" "../output/revanced-patches-${UPSTREAM_TAG}.rvp"
+          test -s "../output/revanced-patches-${UPSTREAM_TAG}.rvp"
+
+      - name: Generate the URV API v4 feed
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM_COMMIT: ${{ steps.upstream.outputs.commit }}
+          RELEASE_TIME: ${{ steps.upstream.outputs.release_time }}
+          DOWNLOAD_URL: ${{ steps.upstream.outputs.download_url }}
+          PAGE_URL: ${{ steps.upstream.outputs.page_url }}
+        run: |
+          set -euo pipefail
+          mkdir -p bundles
+          jq -n \
+            --arg download_url "$DOWNLOAD_URL" \
+            --arg created_at "$RELEASE_TIME" \
+            --arg description "ReVanced Patches $UPSTREAM_TAG, built from upstream commit $UPSTREAM_COMMIT." \
+            --arg version "$UPSTREAM_TAG" \
+            --arg page_url "$PAGE_URL" \
+            '{download_url: $download_url, created_at: $created_at, description: $description, version: $version, page_url: $page_url}' \
+            > "$FEED_PATH"
+
+      - name: Validate feed and artifact before publication
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python scripts/validate_feed.py \
+            --feed "$FEED_PATH" \
+            --artifact "output/revanced-patches-${UPSTREAM_TAG}.rvp" \
+            --expected-version "$UPSTREAM_TAG"
+
+      - name: Publish versioned .rvp release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.upstream.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="output/revanced-patches-${UPSTREAM_TAG}.rvp"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$asset" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$asset" \
+              --title "ReVanced Patches $UPSTREAM_TAG" \
+              --notes "Automated .rvp build from the stable ReVanced patches release $UPSTREAM_TAG.\n\nUpstream source: https://gitlab.com/ReVanced/revanced-patches"
+          fi
+
+      - name: Commit feed only when it changed
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          UPSTREAM_COMMIT: ${{ steps.upstream.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$FEED_PATH"
+          if git diff --cached --quiet; then
+            echo "Feed is unchanged; no commit created."
+          else
+            git commit -m "chore: update ReVanced patches"
+            git push
+            echo "Published $UPSTREAM_TAG ($UPSTREAM_COMMIT)."
+          fi
+
+      - name: Verify the public raw feed after publication
+        env:
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.tag }}
+          RAW_FEED_URL: https://raw.githubusercontent.com/${{ github.repository }}/main/bundles/revanced-latest-patches-bundle.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          trap 'rm -f "$tmp"' EXIT
+          for attempt in 1 2 3 4 5; do
+            if curl --fail --silent --show-error --location --retry 2 "$RAW_FEED_URL" -o "$tmp" \
+              && python scripts/validate_feed.py --feed "$tmp" --expected-version "$UPSTREAM_TAG"; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "The raw GitHub feed did not expose the newly published valid JSON in time." >&2
+          exit 1
